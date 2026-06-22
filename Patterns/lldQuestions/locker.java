@@ -1,6 +1,11 @@
 import java.time.LocalDateTime;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 
@@ -12,6 +17,13 @@ enum LockerSize {
     SMALL,
     MEDIUM,
     LARGE
+}
+
+enum LockerEventType {
+    RESERVED,
+    OCCUPIED,
+    PICKED_UP,
+    EXPIRED
 }
 
 
@@ -47,6 +59,135 @@ class PackageItem {
 
     public String getUserId() {
         return userId;
+    }
+}
+
+
+// ======================================================
+// OBSERVER PATTERN
+// ======================================================
+
+class LockerEvent {
+
+    private LockerEventType type;
+
+    private String lockerId;
+
+    private String packageId;
+
+    public LockerEvent(
+            LockerEventType type,
+            String lockerId,
+            String packageId) {
+
+        this.type = type;
+        this.lockerId = lockerId;
+        this.packageId = packageId;
+    }
+
+    public LockerEventType getType() {
+        return type;
+    }
+
+    public String getLockerId() {
+        return lockerId;
+    }
+
+    public String getPackageId() {
+        return packageId;
+    }
+}
+
+
+interface LockerObserver {
+
+    void onEvent(LockerEvent event);
+}
+
+
+class NotificationObserver
+        implements LockerObserver {
+
+    @Override
+    public void onEvent(
+            LockerEvent event) {
+
+        System.out.println(
+                "[NOTIFICATION] "
+                        + event.getType()
+                        + " lockerId="
+                        + event.getLockerId());
+    }
+}
+
+
+class AnalyticsObserver
+        implements LockerObserver {
+
+    @Override
+    public void onEvent(
+            LockerEvent event) {
+
+        System.out.println(
+                "[ANALYTICS] tracking "
+                        + event.getType());
+    }
+}
+
+
+class AuditObserver
+        implements LockerObserver {
+
+    @Override
+    public void onEvent(
+            LockerEvent event) {
+
+        System.out.println(
+                "[AUDIT] storing audit log "
+                        + event.getType());
+    }
+}
+
+
+// ======================================================
+// EVENT PUBLISHER
+// ======================================================
+
+class LockerEventPublisher {
+
+    private List<LockerObserver> observers;
+
+    private ExecutorService executor;
+
+    public LockerEventPublisher() {
+
+        observers =
+                new CopyOnWriteArrayList<>();
+
+        executor =
+                Executors.newFixedThreadPool(5);
+    }
+
+    public void subscribe(
+            LockerObserver observer) {
+
+        observers.add(observer);
+    }
+
+    public void publish(
+            LockerEvent event) {
+
+        for(LockerObserver observer
+                : observers) {
+
+            executor.submit(() ->
+                    observer.onEvent(event));
+        }
+    }
+
+    public void shutdown() {
+
+        executor.shutdown();
     }
 }
 
@@ -101,11 +242,12 @@ class AvailableState
         locker.setState(
                 new ReservedState());
 
+        locker.publishEvent(
+                LockerEventType.RESERVED);
+
         System.out.println(
                 "Locker RESERVED: "
-                        + locker.getLockerId()
-                        + " OTP: "
-                        + locker.getOtp());
+                        + locker.getLockerId());
     }
 
     @Override
@@ -151,7 +293,7 @@ class ReservedState
             int expiryMinutes) {
 
         throw new RuntimeException(
-                "Locker already reserved");
+                "Already reserved");
     }
 
     @Override
@@ -159,6 +301,9 @@ class ReservedState
 
         locker.setState(
                 new OccupiedState());
+
+        locker.publishEvent(
+                LockerEventType.OCCUPIED);
 
         System.out.println(
                 "Locker OCCUPIED: "
@@ -180,11 +325,14 @@ class ReservedState
         locker.setState(
                 new ExpiredState());
 
-        System.out.println(
-                "Locker EXPIRED: "
-                        + locker.getLockerId());
+        locker.publishEvent(
+                LockerEventType.EXPIRED);
 
         locker.releaseResources();
+
+        System.out.println(
+                "Locker expired: "
+                        + locker.getLockerId());
     }
 
     @Override
@@ -209,7 +357,7 @@ class OccupiedState
             int expiryMinutes) {
 
         throw new RuntimeException(
-                "Locker occupied");
+                "Already occupied");
     }
 
     @Override
@@ -230,14 +378,17 @@ class OccupiedState
                     "Invalid OTP");
         }
 
-        System.out.println(
-                "Package picked from locker: "
-                        + locker.getLockerId());
+        locker.publishEvent(
+                LockerEventType.PICKED_UP);
 
         locker.releaseResources();
 
         locker.setState(
                 new AvailableState());
+
+        System.out.println(
+                "Package picked from locker: "
+                        + locker.getLockerId());
     }
 
     @Override
@@ -246,11 +397,14 @@ class OccupiedState
         locker.setState(
                 new ExpiredState());
 
-        System.out.println(
-                "Locker EXPIRED: "
-                        + locker.getLockerId());
+        locker.publishEvent(
+                LockerEventType.EXPIRED);
 
         locker.releaseResources();
+
+        System.out.println(
+                "Locker expired: "
+                        + locker.getLockerId());
     }
 
     @Override
@@ -327,12 +481,18 @@ class Locker {
 
     private ReentrantLock lock;
 
+    private LockerEventPublisher publisher;
+
     public Locker(
             String lockerId,
-            LockerSize size) {
+            LockerSize size,
+            LockerEventPublisher publisher) {
 
         this.lockerId = lockerId;
+
         this.size = size;
+
+        this.publisher = publisher;
 
         this.state =
                 new AvailableState();
@@ -422,12 +582,20 @@ class Locker {
         otp = null;
 
         expiryTime = null;
+    }
 
-        state = new AvailableState();
+    public void publishEvent(
+            LockerEventType type) {
 
-        System.out.println(
-                "Locker AVAILABLE again: "
-                        + lockerId);
+        if(packageItem == null) {
+            return;
+        }
+
+        publisher.publish(
+                new LockerEvent(
+                        type,
+                        lockerId,
+                        packageItem.getPackageId()));
     }
 
     public String getLockerId() {
@@ -589,6 +757,7 @@ class LockerManager {
             LockerAllocationStrategy strategy) {
 
         this.repository = repository;
+
         this.strategy = strategy;
     }
 
@@ -635,10 +804,8 @@ class LockerExpiryWorker
     @Override
     public void run() {
 
-        List<Locker> lockers =
-                repository.getAllLockers();
-
-        for(Locker locker : lockers) {
+        for(Locker locker
+                : repository.getAllLockers()) {
 
             if(locker.isExpired()) {
 
@@ -653,10 +820,31 @@ class LockerExpiryWorker
 // MAIN
 // ======================================================
 
-public class Main {
+public class locker {
 
     public static void main(String[] args)
             throws Exception {
+
+        // =====================================
+        // OBSERVER SETUP
+        // =====================================
+
+        LockerEventPublisher publisher =
+                new LockerEventPublisher();
+
+        publisher.subscribe(
+                new NotificationObserver());
+
+        publisher.subscribe(
+                new AnalyticsObserver());
+
+        publisher.subscribe(
+                new AuditObserver());
+
+
+        // =====================================
+        // REPOSITORY
+        // =====================================
 
         LockerRepository repository =
                 new LockerRepository();
@@ -664,18 +852,25 @@ public class Main {
         repository.addLocker(
                 new Locker(
                         "L1",
-                        LockerSize.SMALL));
+                        LockerSize.SMALL,
+                        publisher));
 
         repository.addLocker(
                 new Locker(
                         "L2",
-                        LockerSize.MEDIUM));
+                        LockerSize.MEDIUM,
+                        publisher));
 
         repository.addLocker(
                 new Locker(
                         "L3",
-                        LockerSize.LARGE));
+                        LockerSize.LARGE,
+                        publisher));
 
+
+        // =====================================
+        // STRATEGY + MANAGER
+        // =====================================
 
         LockerAllocationStrategy strategy =
                 new BestFitStrategy();
@@ -690,14 +885,10 @@ public class Main {
         // EXECUTOR SERVICE
         // =====================================
 
-        ScheduledExecutorService
-                scheduler =
-
-                Executors
-                        .newScheduledThreadPool(2);
+        ScheduledExecutorService scheduler =
+                Executors.newScheduledThreadPool(2);
 
 
-        // expiry worker every 5 sec
         scheduler.scheduleAtFixedRate(
                 new LockerExpiryWorker(
                         repository),
@@ -708,7 +899,7 @@ public class Main {
 
 
         // =====================================
-        // ALLOCATE PACKAGE
+        // PACKAGE
         // =====================================
 
         PackageItem package1 =
@@ -718,35 +909,36 @@ public class Main {
                         "USER1");
 
 
+        // =====================================
+        // ALLOCATE
+        // =====================================
+
         Locker locker =
                 manager.allocateLocker(
                         package1);
 
 
-        // package delivered
+        // =====================================
+        // PACKAGE DELIVERED
+        // =====================================
+
         locker.occupy();
 
 
         // =====================================
-        // SIMULATE USER PICKUP
+        // USER PICKUP
         // =====================================
 
         Thread.sleep(10000);
 
-        try {
-
-            locker.pickup(
-                    locker.getOtp());
-
-        } catch(Exception e) {
-
-            System.out.println(
-                    e.getMessage());
-        }
+        locker.pickup(
+                locker.getOtp());
 
 
-        Thread.sleep(60000);
+        Thread.sleep(30000);
 
         scheduler.shutdown();
+
+        publisher.shutdown();
     }
 }
